@@ -2,7 +2,6 @@
 #
 # ptktimes - Timesheet replacment
 # Based heavily on ptkmines
-# $Id: ptktimes,v 1.2 2003/02/03 21:20:36 pmh Exp $
 
 
 use 5.004_02; # Because we use while(my $x), for my $y(@a), ...
