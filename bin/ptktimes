@@ -1,0 +1,707 @@
+#!/usr/bin/perl -- -*- perl -*-
+#
+# ptktimes - Timesheet replacment
+# Based heavily on ptkmines
+# $Id: ptktimes,v 1.2 2003/02/03 21:20:36 pmh Exp $
+
+
+use 5.004_02; # Because we use while(my $x), for my $y(@a), ...
+use Tk();
+use IO::File;
+use Time::Local;
+use strict;
+
+# Find config file and open output file
+my @_names=$^O=~/win/i ? ('times.rc','times.out') : ('.timesrc','.times.out');
+my($fn_rc,$fn_out,$outfh);
+for my $dname($ENV{TIMESDIR},$ENV{HOME},'.','/etc'){
+  defined $dname && $dname ne '' or next;
+
+  defined $fn_rc or -r "$dname/$_names[0]" and $fn_rc="$dname/$_names[0]";
+  $outfh||=IO::File->new($fn_out="$dname/$_names[1]",'+>>')
+}
+defined $fn_rc && defined $outfh
+  or die "Can't open config and output files\n";
+$outfh->autoflush(1);
+
+# Collect command line arguments
+my(%report);
+while($ARGV[0]=~s/^-(?!display)//){
+  my $arg=shift;
+  if($arg eq 'report'){
+    $report{__doit}=1;
+  }elsif($arg eq 'fold'){
+    $report{fold}=1;
+  }elsif($arg eq 'range'){
+    my $range=shift;
+    my($from,$to)=split('-',$range);
+    $to||=$from;
+    @report{'range_from','range_to'}=($from,$to);
+  }elsif($arg eq 'total'){
+    $report{total}=1;
+  }elsif($arg eq 'csv'){
+    $report{csv}=1;
+  }else{
+    die "Unknown flag: -$arg\n";
+  }
+}
+
+# Report and exit if requested
+if(keys %report){
+  &report(%report);
+  undef $outfh;
+  exit 0;
+}
+
+Tk->import;
+
+# Catch some signals so we can clean up:
+$SIG{INT} = \&clean_up;
+$SIG{TERM} = \&clean_up;
+$SIG{QUIT} = \&clean_up;
+$SIG{__DIE__}=sub{ warn @_; &clean_up; };
+my $exiting;
+END{ $exiting=1; &clean_up }
+
+# Initialize some global variables:
+my $width = 300;
+my $height = 8;
+my @button;
+
+# Create the main window and set the title to indicate level:
+my $main = MainWindow->new;
+$main->title('Timesheet');
+$main->iconname('Timesheet');
+
+
+# Create the menu bar:
+my $menu_bar = $main->Frame(
+  -relief => 'raised',
+  -borderwidth => 2,
+)->pack(-side => 'top', -fill => 'x');
+
+# Make the file menu:
+my $file_menu = $menu_bar->Menubutton(
+  -text => 'File',
+  -underline => 0,
+)->pack(-side => 'left');
+
+$file_menu->command(
+  -label => 'Reload config',
+  -underline => 0,
+  -command => \&load_file,
+);
+$file_menu->separator;
+$file_menu->command(
+  -label => 'Quit',
+  -underline => 0,
+  -command => \&clean_up,
+);
+
+
+my $frame_main = $main->Frame(
+  -relief => 'raised',
+  -borderwidth => 1,
+)->pack(-side => 'top', -fill => 'x');
+# Create the top frame (for the timer)
+my $frame_time = $frame_main->Frame(
+  -relief => 'sunken',
+  -borderwidth => 2,
+)->pack(
+  -side => 'right',
+  -fill => 'x',
+  -padx => 5,
+  -pady => 5,
+);
+my $timer_label=$frame_time->Label(
+  -text => '00:00:00',
+  -justify => 'center',
+)->pack(
+  -side => 'top',
+);
+my $label_active=1;
+# Create the main frame (for the buttons)
+my $frame_butts = $main->Frame(
+  -relief      => 'sunken',
+  -borderwidth => 2,
+#  -width => $width,
+#  -height => $height*21,
+)->pack(
+  -side   => 'top',
+  -expand => 1,
+  -pady   => 0,
+);
+
+
+# Kludge to fix the visibility/not updating problem (also seen in tcl/tk):
+#  I call this a kludge because I think it should happen automatically, I
+#  shouldn't have to update the window manually.
+#  (only need to update when the MainWindow state changes, not every widget)
+#  Does not completely fix the problem, i.e. when the window is partially
+#  covered and then you remove one thing covering it but it is still partially
+#  covered by something else because the visibility state has not changed.
+#  Change the 1 to a 0 to turn this off.
+if (1) {
+  $main->bind('<Visibility>' => sub {
+    if ($_[0]->XEvent->W eq $main) {
+      $main->update;
+    }
+  });
+}
+
+#
+# Set up some useful bindings:
+#
+
+# Exit game if the window manager deletes me:
+$main->protocol(WM_DELETE_WINDOW => \&clean_up);
+
+# Quit if 'q' is pressed:
+$main->bind('<q>' => \&clean_up);
+# Reload if 'r' is pressed
+$main->bind('<r>' => \&load_file);
+
+# Let the pack geometry manager adjust my size (the user shouldn't need to):
+#  (The mainWindow size gets messed up if the user resizes it and then changes
+#   the dimensions of the game board.)
+$main->resizable(0,0);
+
+# Load config file
+&load_file();
+
+# Now start the main event loop:
+Tk::MainLoop;
+
+
+# Function to update the timer label:
+#
+sub change_timer_label {
+  my ($num) = @_;
+    
+  $timer_label->configure(-text => $num)
+    if $label_active;
+}
+
+
+#
+# Function to do clean-up (if any) and exit:
+#
+sub clean_up {
+    my ($sig) = @_;
+
+    undef $label_active;
+    &start_active('Stop');
+    
+    exit 0 unless $exiting;
+}
+
+
+
+my($activity,$start_time,@optionmenus,$popup_activity,$popup_lock);
+################################################################################
+# Subroutine: load_file()
+# Description: Load config file $fn_rc
+# Author: Peter Haworth
+sub load_file{
+  my $fh=IO::File->new($fn_rc,'<')
+    or die "Can't open file $fn_rc: $!";
+  @button=@optionmenus=();
+  my(%tags,%names,%defs);
+  my $new;
+  while(<$fh>){
+    s/#.*//;
+    next unless /\S/;
+    chomp;
+
+    my($_tag,$prefix,$popup,$continue);
+    s/^\[([^\]]*)]\s*// and $_tag=$1;
+    if($_tag=~s/^\*//){
+      # This is an option
+      if($_tag eq 'new'){
+	$new=1;
+      }elsif($_tag eq 'new2'){
+	$new=2;
+      }elsif($_tag=~/^\s*prefix\s+(.+?)\s*$/){
+	if($new==2){
+	  $prefix=$1;
+	}else{
+	  warn "[*prefix] modifier only available with [*new2] option\n";
+	}
+      }elsif($_tag=~/^\s*def\s+(\w+)\s*$/){
+	my $def=lc $1;
+	die "Redefinition of [*def $def]"
+	  if $defs{$def};
+	/\S/
+	  or die "Empty definition [*def $def]";
+	$defs{$def}=$_;
+      }elsif($_tag=~/^\s*use_popup\s+(\w+)\s*$/){
+	if($new==2){
+	  my $def=lc $1;
+	  die "Use of undefined list [*$_tag]"
+	    unless $def=$defs{$def};
+	  /\S/
+	    or die "Invalid use of [*$_tag]";
+	  my($label,$has_code,$code)=/^\s*([^()]+?)\s*(?:(\(\s*(.*?)\)))?\s*$/
+	    or die "Unparseable entry: $_\n";
+	  $code||=$label;
+	  $prefix=$code;
+	  $popup=$label;
+	  $_=$def;
+	  $continue=1;
+	}else{
+	  warn "[*use_popup] modifier only available with [*new2] option\n";
+	}
+      }elsif($new==2){
+	warn "[*$_tag] not implemented yet\n";
+      }else{
+	die "Unknown option: *$_tag\n";
+      }
+      next unless $continue;
+    }
+    if($new==1){
+      my @tags=split '/',$_tag;
+      my @names=split '/';
+      my $name_;
+      my @butts;
+      for(0..$#names){
+	my $tag=$tags[$_];
+	my $name=$names[$_];
+	$name_||=$name;
+	my $opts;
+	$tag=~s/^([^\w\s]*)\s*// and $opts=$1;
+	my $tname=$name;
+	$tname="$name_: $tname" if $opts=~/:/;
+	$tags{lc $tname}=$tag;
+	$names{$tag}||=$tname;
+	push @butts,[$name,$tname] unless $opts=~/-/;
+      }
+      push @button,\@butts if @butts;
+    }elsif($new==2){
+      my @butts;
+      for(split /\s*,\s*/){
+	my($label,$has_code,$code)=/^\s*([^()]+?)\s*(?:(\(\s*(.*?)\)))?\s*$/
+	  or die "Unparseable entry: $_\n";
+	my $hide=$code=~s/^-\s*//;
+	$code||=$label;
+	$code="$prefix/$code" if $prefix;
+
+	$tags{lc $label}=$code;
+	$names{lc $code}=$label;
+	push @butts,[$label,$code] unless $hide;
+      }
+      if(@butts){
+	unshift @butts,[$popup,'--popup--'] if $popup;
+	push @button,\@butts
+      }
+    }else{
+      push @button,[[$_,$_],[Support => "$_: Support"]]
+	unless $_tag=~s/^-//;
+      my($act,$supp)=split('/',$_tag);
+      $tags{lc $_}=$act;
+      $tags{lc "$_: Support"}=$supp;
+      $names{$act}||=$_;
+      $names{$supp}||="$_: Support";
+    }
+  }
+  $tags{"\377"}={"\377\377\377"} unless $new; # Force total to end
+
+  if($main){
+    # Destroy existing buttons
+    $main->Busy;
+    foreach($frame_butts->children){
+      $_->destroy;
+    }
+
+    # Add in new buttons
+    my $butt;
+    foreach(@button){
+      my $pair=$frame_butts->Frame(
+	-relief => 'sunken',
+	-borderwidth => 0,
+      )->pack(
+	-side => 'top',
+	-expand => 1,
+	-fill => 'x',
+	-pady => 0,
+      );
+      if($_->[0][1] eq '--popup--'){
+	my $popup=shift(@$_)->[0];
+	$pair->Label(
+	  -text => $popup,
+	  -height => 1,
+	  -borderwidth => 1,
+	)->pack(-side => 'left',-pady => 0, -expand => 1, -fill => 'x');
+
+        my $setup;
+	my $trigger;
+        my $list;
+	$list=$pair->Optionmenu(
+	  -height => 1,
+	  -borderwidth => 1,
+	  -highlightthickness => 0,
+	  -options => ['----',@$_],
+	  -command => sub{
+	    my($code)=@_;
+	    return if !$setup || $popup_lock || $trigger eq '----';
+
+	    ++$popup_lock;
+	    for(@optionmenus){
+	      $_->setOption('----') unless $_==$list;
+	    }
+	    $activity=$popup;
+	    &start_active($code);
+	    --$popup_lock;
+	  },
+	  -variable => \$trigger,
+        )->pack(-side => 'left',-pady => 0, -expand => 1, -fill => 'x');
+	$list->setOption('----');
+	push @optionmenus,$list;
+	$setup=1;
+      }else{
+	foreach(@$_){
+	  my($name,$tname)=@$_;
+
+	  $butt=$pair->Radiobutton(
+	    -text => $name,
+	    -height => 1,
+	    -borderwidth        => 1,
+	    -highlightthickness => 0,
+	    -indicatoron => 0,
+	    -variable => \$activity,
+	    -value => $tname,
+	  )->pack(-side => 'left',-pady => 0, -expand => 1, -fill => 'x');
+
+	  $butt->configure(-command => [\&start_active,$tname]);
+	}
+      }
+    }
+
+    $butt=$frame_butts->Radiobutton(
+      -text => 'Stop',
+      -height => 1,
+      -borderwidth => 1,
+      -highlightthickness => 0,
+      -indicatoron => 0,
+      -variable => \$activity,
+      -value => 'Stop',
+    )->pack(-side => 'left',-pady => 0, -expand => 1, -fill => 'x');
+
+    $butt->configure(-command => [\&start_active,'Stop']);
+
+    $activity='Stop';
+    &start_active('Stop');
+    $main->Unbusy;
+  }
+
+  (\%names,\%tags);
+}
+
+sub start_active{
+  my($butt)=@_;
+
+  return unless $outfh;
+
+  if(!$popup_lock){
+    foreach(@optionmenus){
+      $_->setOption('----');
+    }
+  }
+
+  $start_time=time;
+  my($sec,$min,$hour,$day,$mon,$year)=(localtime)[0..5];
+  ++$mon;
+  $year+=1900;
+  printf $outfh "%04d/%02d/%02d %02d:%02d:%02d %s\n",
+    $year,$mon,$day,$hour,$min,$sec,$butt;
+  &change_timer_label(sprintf("%02d:%02d:%02d",$hour,$min,$sec));
+}
+
+sub report{
+  my %opts=@_;
+
+  seek($outfh,0,0)
+    or die "Can't seek output file: $!";
+  
+  # Load tags
+  my($names,$tags)=&load_file();
+
+  # Total up each activity
+  my($days,%times,%ttimes,$odate,$otime,$oactivity,%csv);
+  my($year,$mon,$day,$n_days,$first,$last);
+  while(<$outfh>){
+    chomp;
+    my($date,$tod,$activity)=/^(\S+)\s+(\S+)\s+(.*)/;
+    $activity=$tags->{lc $activity} || " $activity";
+
+    next if $opts{range_from} && $date lt $opts{range_from};
+
+    if($date ne $odate){
+      &report_day($odate,\%times,undef,\%opts,\%csv,$names) if $odate;
+      %times=();
+      $odate=$date;
+      last if $opts{range_to} && $date gt $opts{range_to};
+
+      ++$days;
+      ($year,$mon,$day)=split('/',$odate);
+      $year-=1900;
+      $mon--;
+      $first||=$odate;
+      $last=$odate;
+    }
+
+    my($hour,$min,$sec)=split(':',$tod);
+    my $time=eval { timelocal($sec,$min,$hour,$day,$mon,$year); }
+      or warn "Invalid time/date: $odate $tod" and next;
+    if($otime and my $duration=$time-$otime){
+      $times{$oactivity}+=$duration;
+      $ttimes{$oactivity}+=$duration;
+    }
+    $otime=$time;
+    $oactivity=$activity;
+  }
+  # Don't forget the current activity!
+  if($oactivity and my $duration=time-$otime){
+    $times{$oactivity}+=$duration;
+    $ttimes{$oactivity}+=$duration;
+  }
+  &report_day($odate,\%times,undef,\%opts,\%csv,$names)
+    if $odate && keys %times;
+
+  &report_day('TOTAL',\%ttimes,$days,\%opts,\%csv,$names) if $days>1 || $opts{total};
+  &report_csv($opts{total} ? ('TOTAL','') : ($first,$last),\%csv,\%opts,$names)
+    if $opts{csv};
+}
+
+sub report_day{
+  my($period,$times,$n_days,$opts,$csv,$names)=@_;
+
+  my($total,%totals);
+  while(my($key,$value)=each %$times){
+    next if $key=~/^ ?Stop$/;
+    $total+=$value;
+
+    $totals{$key}+=$value;
+  }
+
+#  while(my($key,$value)=each %totals){
+#    $$times{"$key\377"}=$value
+#      unless $$times{$key};
+#  }
+  if($csv){
+    while(my($key,$value)=each %$times){
+      $csv->{$key}{$period}=$value;
+    }
+  }
+  $$times{"\377"}=$total;
+
+  return if $opts->{total} && $period ne 'TOTAL' || $opts->{csv} || !$total;
+
+  print "$period:\n";
+  foreach my $key(sort keys %$times){
+    next if $key=~/^ ?Stop$/;
+    my $name;
+    if(my $sname=$names->{$key}){
+      $name="$key $sname";
+    }else{
+      ($name=$key)=~s/^\s+//;
+    }
+
+    my $time=$times->{$key};
+    my $perc=sprintf("%6.2f",(100*$time)/$total);
+    my $div7=$n_days ? 7*$n_days*3600 : 7*3600;
+    my $perc7=sprintf("%6.2f",(100*$time)/$div7);
+    my $dec=sprintf("%8.4f",$time/3600);
+    use integer;
+
+    my $hours=$time/3600;
+    $time-=$hours*3600;
+    my $mins=$time/60;
+    $time-=$mins*60;
+
+    {
+      local *_=\$name;
+      s#/maintenance adaptive\z#/m-adapt#;
+      s#/maintenance corrective\z#/m-correct#;
+      s#/maintenance performance\z#/m-perf#;
+      s#/diagnostics\z#/diag#;
+      s#/developers-forum\z#/devforum#;
+      s#/hardware\+software/#/hard+soft/#;
+      s#Time recording/data-entry#timesheet#;
+      s#\AJournals/#Jnls/#;
+      s#Journals Subs#Subs#;
+      s#\ACorporate/#Corp/#;
+      s#\ADepartment/#Dept/#;
+      s#\AIOP London/#IOP/#;
+      s/\377/  - Total/;
+    }
+    printf "%-39s %3d:%02d:%02d [%8s] (%s%%) (%s%%)\n",
+      "$name:",$hours,$mins,$time,$dec,$perc,$perc7;
+  }
+}
+
+sub report_csv{
+  my($first,$last,$csv,$opts,$names)=@_;
+
+  my @days=($first);
+  my($year,$mon,$day)=split('/',$first);
+  my $time=eval { timelocal(0,0,12,$day,$mon-1,$year-1900); };
+  my $date=$first;
+
+  while(1){
+    $time+=86400;
+    my($day,$mon,$year)=(localtime $time)[3,4,5];
+    $date=sprintf("%04d/%02d/%02d",$year+1900,$mon+1,$day);
+    last if $date gt $last;
+    push @days,$date;
+  }
+
+  print &csv('Project',@days);
+  foreach my $project(sort keys %$csv){
+    next if $project=~/^ ?Stop$/;
+    
+    my @times=map { sprintf("%.6f",$_/3600) } @{$csv->{$project}}{@days};
+    $project=~s/\377/  - Total/;
+    if(my $name=$names->{$project}){
+      $project="$project: $name"
+	if $project ne "\377\377\377";
+    }
+    print &csv($project,@times);
+  }
+}
+
+sub csv{
+  my $str;
+  while(@_){
+    $str.=',' if defined $str;
+    (my $x=shift)=~s/"/""/;
+    $str.=qq("$x");
+  }
+  $str."\n";
+}
+
+
+__END__
+
+=head1 NAME
+
+ptktimes
+
+=head1 SYNOPSIS
+
+  ptktimes [Tk options]
+  ptktimes -report
+  ptktimes [-report] (-range from[-to] | -total | -fold | -csv)
+
+=head1 DESCRIPTION
+
+ptktimes with no arguments (or with only Tk options) presents a window
+containing a list of possible tasks displayed on individual radio buttons.
+The duration each button is pressed is recorded in a file whose contents
+may be reported using the options listed below.
+
+The list of tasks presented are read from a simple text file, located as
+described in the FILES section, whose contents are the name of each
+task, one per line. The tasks are presented in the same order as they are
+listed in the file, with the addition of a "Support" button next to each task.
+The "Support" buttons are for recording time spent on support for each service.
+
+If a line in the file begins with a left bracket (C<[>), the text up to the next
+close bracket (C<]>) is used to modify the behaviour of the line. If the first
+character between the brackets is a dash (C<->), the line will not be listed
+as a button in the task window. The remaining characters, if present, are used
+to sort reports. Codes for the main button and support button may be separated
+by a slash (C</>). For example, if the following file contents are read:
+
+  [G01] Admin
+  [-G04] Annual Leave
+  [D02/S04] Project X
+  [D03/S01] Project Y
+
+The task window will contain the following buttons:
+
+  Admin          Support
+  Project X      Support
+  Project Y      Support
+
+'Annual Leave' will not appear, because of the leading dash in the brackets
+The 'support' button for 'Admin' cannot currently be disabled. If a CSV report
+is requested which includes all of the above tasks, plus any 'Annual Leave'
+manually edited into the recorded time file, the first column will hold the
+following values, sorted according to the codes in brackets:
+
+  D02: Project X
+  D03: Project Y
+  G01: Admin
+  G04: Annual Leave
+  S01: Project Y
+  S04: Project X
+
+In the absence of explicit codes, reports are ordered alphabetically by task.
+
+=head1 OPTIONS
+
+When given any of the available options, ptktimes reports the contents of its
+output file. Reports may be run while the ptktimes window is active, and will
+take account of the currently active task.
+
+=over 4
+
+=item -report
+
+Produce a report. This option will be assumed if any other reporting options
+are specified. The report lists for each day: the task, the total duration
+of the task in hh:mm:ss format, the total duration in decimal hours, the
+percentage of time spent on the task, and the percentage of 7 hours spent.
+Within each day, tasks are listed in alphabetical order.
+A total line is given for each day, as is a summary total for all reported days.
+
+=item -fold
+
+Combine entries after removing parenthesised parts. By default, each task is
+listed separately, with combined entries totalled. With this option, only the
+combined total is displayed.
+
+=item -total
+
+Only display the summary total.
+
+=item -range from[-to]
+
+Restrict reporting to the given range of dates. Dates B<must> be in
+YYYY/MM/DD format. If the to date is omitted, reporting will be restricted
+to just the from date.
+
+=item -csv
+
+Produce a report in comma separated value format, with one row for each task
+and one column for each day. This format includes all days within the range
+specified, including days on which no tasks were recorded. This makes it
+easy to cut and paste rows into timesheet spreadsheets.
+
+=back
+
+=head1 FILES
+
+=over 4
+
+=item .timesrc
+
+=item times.rc
+
+Filenames used on Unix and Windows systems respectively to hold the list of
+possible tasks. This file is searched for in the following directories:
+$TIMESDIR, $HOME, F<.>, F</etc>
+
+=item .times.out
+
+=item times.out
+
+Filenames used on Unix and Windows systems respectively to hold the recorded
+times. This file is searched for in the same directories as the resource file.
+
+=back
+
+=head1 AUTHOR
+
+Peter Haworth F<E<lt>pmh@edison.ioppublishing.comE<gt>>
+

@@ -1,0 +1,25 @@
+#!/usr/bin/perl
+
+use GDBM_File;
+use strict;
+
+my $host=shift || 'xterm';
+(my $whost=$host)=~s/\..*//;
+my $dbfile="$ENV{HOME}/.xlogin";
+
+tie my %db,GDBM_File => $dbfile,&GDBM_WRCREAT,0640;
+my $count=++$db{$host};
+untie %db;
+
+if(my $pid=fork){
+  exit;
+}elsif(!defined $pid){
+  die "Can't fork: $!\n";
+}else{
+  exec('xterm','-aw','-cn','-j','-rw','-s','-fg','white','-bg','black','-sl','10240',
+    '-name',"xterm-$whost",'-title',"$host\[$count]",'-n',"$host\[$count]",
+    $host eq 'xterm' ? ('-ls',@ARGV)
+    : ('+ls','-e','ssh',$host,@ARGV),
+  );
+  die "Can't exec: $!\n";
+}

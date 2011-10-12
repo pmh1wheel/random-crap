@@ -1,0 +1,56 @@
+#!/usr/bin/perl -w
+
+# xleave: Open a window with a rude message, telling the user to leave now
+
+use Tk qw(:eventtypes);
+use strict;
+use vars qw($MW);
+
+my($display,$force);
+while(@ARGV && $ARGV[0]=~s/^-//){
+  my $flag=shift;
+  if($flag eq 'display'){
+    $display=shift;
+  }elsif($flag eq 'force'){
+    $force=1;
+  }else{
+    die "Unknown flag: -$flag\n";
+  }
+}
+my($text)=@ARGV?$ARGV[0]:'LEAVE NOW YOU LETHARGIC IDIOT!';
+
+if(!$force){
+  if((my $time=(-M "$ENV{HOME}/.xleave-no")||0)>1/96){
+    unlink "$ENV{HOME}/.xleave-no";
+  }elsif($time){
+    exit 0;
+  }
+
+  my $blanked=`xscreensaver-command -time`;
+  exit 0 if $blanked=~/\s(?:blank|locked)/;
+}
+
+eval {
+  $MW = MainWindow->new(
+    -title => 'xleave',
+    (defined $display ? (-screen  => $display) : ()),
+  );
+} or exit;
+
+my $quit;
+sub quit{ $quit=1; }
+$MW->protocol(WM_DELETE_WINDOW => \&quit);
+
+my $button = $MW->Button(
+    -text    => $text,
+    -width   => 100,
+    -height  => 10,
+    -command => \&quit,
+);
+$button->pack;
+
+
+while(!$quit){
+  Tk::DoOneEvent(ALL_EVENTS);
+}
+
