@@ -4,11 +4,13 @@
 # Based heavily on ptkmines
 
 
-use 5.004_02; # Because we use while(my $x), for my $y(@a), ...
+use v5.30;
 use Tk();
 use IO::File;
 use Time::Local;
 use strict;
+
+my $secs_per_day = 7 * 60 * 60;
 
 # Find config file and open output file
 my @_names=$^O=~/win/i ? ('times.rc','times.out') : ('.timesrc','.times.out');
@@ -25,24 +27,28 @@ $outfh->autoflush(1);
 
 # Collect command line arguments
 my(%report);
-while($ARGV[0]=~s/^-(?!display)//){
-  my $arg=shift;
-  if($arg eq 'report'){
-    $report{__doit}=1;
-  }elsif($arg eq 'fold'){
-    $report{fold}=1;
-  }elsif($arg eq 'range'){
-    my $range=shift;
-    my($from,$to)=split('-',$range);
-    $to||=$from;
-    @report{'range_from','range_to'}=($from,$to);
-  }elsif($arg eq 'total'){
-    $report{total}=1;
-  }elsif($arg eq 'csv'){
-    $report{csv}=1;
-  }else{
-    die "Unknown flag: -$arg\n";
-  }
+while ($ARGV[0] =~ s/^-(?!display)//) {
+    my $arg=shift;
+    if ($arg eq 'report') {
+        $report{__doit} = 1;
+    } elsif ($arg eq 'fold') {
+        $report{fold}  =1;
+    } elsif ($arg eq 'range') {
+        my $range = shift;
+        my ($from, $to) = split '-', $range;
+        $to ||= $from;
+        @report{'range_from', 'range_to'} = ($from, $to);
+    } elsif ($arg eq 'lines') {
+        $report{lines} = 1;
+    } elsif ($arg eq 'round') {
+        $report{round} = 1;
+    } elsif ($arg eq 'total') {
+        $report{total} = 1;
+    } elsif ($arg eq 'csv') {
+        $report{csv} = 1;
+    } else {
+        die "Unknown flag: -$arg\n";
+    }
 }
 
 # Report and exit if requested
@@ -163,7 +169,7 @@ $main->bind('<r>' => \&load_file);
 # Let the pack geometry manager adjust my size (the user shouldn't need to):
 #  (The mainWindow size gets messed up if the user resizes it and then changes
 #   the dimensions of the game board.)
-$main->resizable(0,0);
+#$main->resizable(0,0);
 
 # Load config file
 &load_file();
@@ -220,6 +226,15 @@ sub load_file{
 	$new=1;
       }elsif($_tag eq 'new2'){
 	$new=2;
+      } elsif ($_tag eq 'perday'){
+          my ($hours, $mins, @rest) = split ' ';
+          if ($hours !~ /\A\d*\z/ || $hours < 1 || $hours > 16
+          || ($mins //= 0) !~ /\A\d*\z/ || $mins > 59
+          || @rest
+          ) {
+            die "Invalid [*$_tag] specification\n";
+          }
+          $secs_per_day = ($hours * 60 + $mins) * 60;
       }elsif($_tag=~/^\s*prefix\s+(.+?)\s*$/){
 	if($new==2){
 	  $prefix=$1;
@@ -425,7 +440,7 @@ sub report{
   my($names,$tags)=&load_file();
 
   # Total up each activity
-  my($days,%times,%ttimes,$odate,$otime,$oactivity,%csv);
+  my($days,%times,%ttimes,$odate,$otime,$otod,$oactivity,%csv);
   my($year,$mon,$day,$n_days,$first,$last);
   while(<$outfh>){
     chomp;
@@ -435,17 +450,22 @@ sub report{
     next if $opts{range_from} && $date lt $opts{range_from};
 
     if($date ne $odate){
-      &report_day($odate,\%times,undef,\%opts,\%csv,$names) if $odate;
+      &report_day($odate,\%times,undef,\%opts,\%csv,$names) if $odate && !$opts{lines};
       %times=();
       $odate=$date;
       last if $opts{range_to} && $date gt $opts{range_to};
 
+      print "$date:\n" if $opts{lines};
       ++$days;
       ($year,$mon,$day)=split('/',$odate);
       $year-=1900;
       $mon--;
       $first||=$odate;
       $last=$odate;
+    }
+
+    if ($opts{lines} && $oactivity ne '' && $oactivity !~ /\A\s* Stop\z/) {
+        print "$otod $tod $oactivity\n";
     }
 
     my($hour,$min,$sec)=split(':',$tod);
@@ -456,12 +476,21 @@ sub report{
       $ttimes{$oactivity}+=$duration;
     }
     $otime=$time;
+    $otod = $tod;
     $oactivity=$activity;
   }
   # Don't forget the current activity!
   if($oactivity and my $duration=time-$otime){
     $times{$oactivity}+=$duration;
     $ttimes{$oactivity}+=$duration;
+
+    if ($opts{lines}) {
+        if ($oactivity !~ /\A\s* Stop\z/) {
+            my ($s, $m, $h) = localtime;
+            printf "%s %02d:%02d:%02d %s\n", $otod, $h, $m, $s, $oactivity;
+        }
+        return;
+    }
   }
   &report_day($odate,\%times,undef,\%opts,\%csv,$names)
     if $odate && keys %times;
@@ -482,16 +511,12 @@ sub report_day{
     $totals{$key}+=$value;
   }
 
-#  while(my($key,$value)=each %totals){
-#    $$times{"$key\377"}=$value
-#      unless $$times{$key};
-#  }
   if($csv){
     while(my($key,$value)=each %$times){
       $csv->{$key}{$period}=$value;
     }
   }
-  $$times{"\377"}=$total;
+  $times->{"\377"}=$total;
 
   return if $opts->{total} && $period ne 'TOTAL' || $opts->{csv} || !$total;
 
@@ -505,38 +530,37 @@ sub report_day{
       ($name=$key)=~s/^\s+//;
     }
 
-    my $time=$times->{$key};
-    my $perc=sprintf("%6.2f",(100*$time)/$total);
-    my $div7=$n_days ? 7*$n_days*3600 : 7*3600;
-    my $perc7=sprintf("%6.2f",(100*$time)/$div7);
-    my $dec=sprintf("%8.4f",$time/3600);
-    use integer;
-
-    my $hours=$time/3600;
-    $time-=$hours*3600;
-    my $mins=$time/60;
-    $time-=$mins*60;
-
-    {
-      local *_=\$name;
-      s#/maintenance adaptive\z#/m-adapt#;
-      s#/maintenance corrective\z#/m-correct#;
-      s#/maintenance performance\z#/m-perf#;
-      s#/diagnostics\z#/diag#;
-      s#/developers-forum\z#/devforum#;
-      s#/hardware\+software/#/hard+soft/#;
-      s#Time recording/data-entry#timesheet#;
-      s#\AJournals/#Jnls/#;
-      s#Journals Subs#Subs#;
-      s#\ACorporate/#Corp/#;
-      s#\ADepartment/#Dept/#;
-      s#\AIOP London/#IOP/#;
-      s/\377/  - Total/;
+    my $time = $times->{$key};
+    my $target = ($n_days || 1) * $secs_per_day;
+    my $col2 = sprintf "%6.2f%", (100 * $time) / $target;
+    if ($name =~ s/\377/  - Total/) {
+        my $over_target = $time - $target;
+        $col2 = time_str_plus($over_target);
     }
-    printf "%-39s %3d:%02d:%02d [%8s] (%s%%) (%s%%)\n",
-      "$name:",$hours,$mins,$time,$dec,$perc,$perc7;
+
+    printf "%-59s %9s (%9s)\n", "$name", time_str($time), $col2;
   }
 }
+
+sub time_str_plus {
+    my ($secs) = @_;
+
+    use integer;
+    my $sign = $secs < 0 ? '-' : '+';
+    $secs = abs $secs;
+    my $hours = $secs / 3600;
+    $secs -= $hours * 3600;
+    my $mins = $secs / 60;
+    $secs -= $mins * 60;
+
+    sprintf "%s%d:%02d:%02d", $sign, $hours, $mins, $secs;
+}
+
+sub time_str {
+    my ($secs) = @_;
+    time_str_plus($secs) =~ s/\A\+//r;
+}
+
 
 sub report_csv{
   my($first,$last,$csv,$opts,$names)=@_;
